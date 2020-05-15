@@ -1,0 +1,232 @@
+---
+title: "Main"
+author: "Samir Hadzic"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+Loading required packages
+
+```{r message=FALSE}
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+  BiocManager::install(c('EBImage'))
+}
+
+packages <- c('R.matlab', 'readxl', 'dplyr', 'ggplot2', 'caret', 'glmnet', 'pROC')
+# lapply(X = packages, FUN = function(package) if (!require(package)) {install.packages(package, dependencies = TRUE)})
+lapply(X = packages, FUN = library, character.only = TRUE)
+```
+
+### Step 0 set work directories
+```{r wkdir, eval=FALSE}
+set.seed(0)
+# setwd("~/Project3-FacialEmotionRecognition/doc")
+```
+
+Provide directories for training images. Training images and Training fiducial points will be in different subfolders. 
+```{r}
+train_dir <- "../data/train_set/" # This will be modified for different data sets.
+train_image_dir <- paste(train_dir, "images/", sep = "")
+train_pt_dir <- paste(train_dir,  "points/", sep = "")
+train_label_path <- paste(train_dir, "label.csv", sep = "") 
+```
+
+
+### Step 1: set up controls for evaluation experiments.
+
+In this chunk, we have a set of controls for the evaluation experiments. 
+
++ (T/F) cross-validation on the training set
++ (number) K, the number of CV folds
++ (T/F) process features for training set
++ (T/F) run evaluation on an independent test set
++ (T/F) process features for test set
+
+Using cross-validation or independent test set evaluation, we compare the performance of models with different specifications. In this code we will be evaluating a LASSO/Ridge multinomial classifiers. 
+
+```{r exp_setup}
+run.cv = TRUE # run cross-validation on the training set for optimal penalty term hyperparameter 
+
+K <- 5  # number of CV folds
+
+alpha <- 1 # alpha 1 equals lasso, 0 equals ridge
+
+run.feature.train = TRUE # process features for training set
+
+run.feature.test = TRUE # process features for test set
+
+run.test = TRUE # run evaluation on an independent test set
+
+run.full.test = FALSE # run testing on totally new, full 2500 obs dataset without splitting into training and testing
+
+# accuracy results only produced if we have emotion_idx in the data. if yes, set labels_present to true
+labels.present = TRUE
+
+```
+
+### Step 2: import data and train-validation-test split 
+```{r}
+# train-validation-test split
+info <- read.csv(train_label_path)
+
+if (run.full.test) {
+  test_idx = info$Index
+} else {
+  # 80% train, 20% test
+  train_split <- sample(x = info$Index, size = floor(nrow(info) * 0.8), replace = F)
+  train_idx <- info$Index[train_split]
+  test_idx <- info$Index[-train_split]
+  
+  if (any(duplicated(c(train_idx, test_idx)))) {
+    print('Train-Validation-Test Error, Non-Unique IDs Present')
+  }
+}
+
+```
+
+Importing fiducial data
+
+```{r read fiducial points}
+#function to read fiducial points
+#input: index
+#output: matrix of fiducial points corresponding to the index
+n_files <- length(list.files(train_image_dir))
+
+readMat.matrix <- function(index){
+     return(round(readMat(paste0(train_pt_dir, sprintf("%04d", index), ".mat"))[[1]], 0))
+}
+
+#load fiducial points
+fiducial_pt_list <- lapply(1:n_files, readMat.matrix)
+save(fiducial_pt_list, file = "../output/fiducial_pt_list.RData")
+```
+
+### Step 3: construct features and responses
+
+`feature.R` should be the wrapper for all your feature engineering functions and options. The function `feature( )` should have options that correspond to different scenarios for your project and produces an R object that contains features and responses that are required by all the models you are going to evaluate later. 
+  
+  + `feature.R`
+  + Input: list of images or fiducial point
+  + Output: an RData file that contains extracted features and corresponding responses
+
+```{r feature}
+
+source("../lib/feature.R")
+
+tm_feature_train <- NA
+if (run.feature.train) {
+  tm_feature_train <- system.time(dat_train <- feature(fiducial_pt_list, train_idx))
+  save(dat_train, file = "../output/feature_train.RData")
+}
+
+tm_feature_test <- NA
+if (run.feature.test) {
+  tm_feature_test <- system.time(dat_test <- feature(fiducial_pt_list, test_idx))
+  save(dat_test, file = "../output/feature_test.RData")
+}
+
+
+```
+
+### Step 4: Train a classification model with training features and responses
+Call the train model and test model from library. 
+
+`train.R` and `test.R` should be wrappers for all your model training steps and your classification/prediction steps. 
+
++ `train.R`
+  + Input: a data frame containing features and labels and a parameter list.
+  + Output:a trained model
++ `test.R`
+  + Input: the fitted classification model using training data and processed features from testing images 
+  + Input: an R object that contains a trained classifier.
+  + Output: training model specification
+
++ In this Starter Code, we use KNN to do classification. 
+
+```{r loadlib}
+source("../lib/train.R")
+source("../lib/test.R")
+```
+
+#### Model selection with cross-validation
+* Model selection by choosing among different values of LASSO/Ridge penalty term, selecting value with lowest class. error.
+```{r runcv, eval=F}
+
+# if(run.cv) {
+#   tm_train <- system.time(cv_models <- train(feature_df = dat_train, alpha = alpha, n_folds = K, cv_measure = 'class'))
+#   save(cv_models, file="../output/cv_models.RData")
+# }
+
+load("../output/cv_models.Rdata")
+
+```
+
+Visualize cross-validation results. 
+```{r cv_vis}
+plot(cv_models)
+```
+
+
+* The "best" parameter value and model coefficients are stored within cv_models, we can simply call them in predict() through the glmnet package. To obtain the individual parameter value or coefficients, see below.
+
+### Step 5: Run test on test images
+```{r test}
+
+tm_test = NA
+if (run.test) {
+  tm_test <- system.time(pred <- test(cv_models, dat_test))
+}
+
+```
+
+* evaluation
+```{r}
+### EVALUATION ###
+
+if (labels.present) {
+  model <- ifelse(alpha == 1, 'LASSO', 'Ridge')
+  accu <- mean(dat_test$emotion_idx == pred)
+  cat("The accuracy of the", model, "model is:", accu*100, "%.\n")
+  length(levels(pred))
+  dat_test$emotion_idx <- as.factor(dat_test$emotion_idx)
+  length(dat_test$emotion_idx)
+  length(pred)
+  confusionMatrix(data = pred, reference = dat_test$emotion_idx)
+  # to observe specific parameter and coefficient values
+  # cv_models$lambda.min  
+  # coef(cv_models, s = cv_models$lambda.min)
+}
+
+
+```
+
+### Summarize Running Time
+Prediction performance matters, so does the running times for constructing features and for training the model, especially when the computation resource is limited. 
+```{r running_time}
+if (labels.present) {
+  cat("Time for constructing training features=", tm_feature_train[1], "s \n")
+  cat("Time for constructing testing features=", tm_feature_test[1], "s \n")
+  cat("Time for training model=", tm_train[1], "s \n")
+  cat("Time for testing model=", tm_test[1], "s \n")
+  write.csv(dat_test, 'features.csv')
+}
+
+```
+
+Writing labels.csv -- only contains image index and predicted emotion
+```{r}
+if (run.full.test) {
+  labels <- data.frame(index = 1:nrow(dat_test), identity = rep(NA, nrow(dat_test)), emotion_idx = pred)
+  write.csv(labels, 'model_labels.csv')
+} 
+ # to_match <- info[, c('emotion_idx', 'emotion_cat', 'type')]
+# to_match <- to_match[!duplicated(to_match),]
+# to_match$emotion_idx <- as.factor(to_match$emotion_idx)
+# labels <- left_join(labels, to_match, by = "emotion_idx")
+
+```
+###Reference
+- Du, S., Tao, Y., & Martinez, A. M. (2014). Compound facial expressions of emotion. Proceedings of the National Academy of Sciences, 111(15), E1454-E1462.
